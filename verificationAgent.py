@@ -318,7 +318,7 @@ OUTPUT:
         url_texts = state.get("url_texts", [])
         vault_usd = state.get("vault_balance_usd", 0.0)
 
-        prompt = f"""You are verifying an NGO reimbursement claim.
+        prompt = f"""You are verifying an NGO reimbursement claim. The entire request comes from the CLAIM TEXT below—derive all amounts and summaries from it.
 
 VAULT FUNDS AVAILABLE (USD): {vault_usd}
 
@@ -329,9 +329,12 @@ LINK CONTENT SNIPPETS (may be HTML):
 {url_texts}
 
 TASK:
-1) Extract the requested amount in USD if stated (number only). If not stated, set to null.
-2) Summarize what the NGO claims they did (impact + actions) in 3-6 bullet points.
-3) Summarize what evidence is present/credible (receipts mentioned, links, etc.) in 3-6 bullet points.
+1) Extract the requested amount in USD (claim_amount_usd) from the CLAIM TEXT:
+   - If the claim states a specific dollar amount (e.g. "we need $500", "requesting 200 USD"), use that number.
+   - If the claim states a percentage of an amount (e.g. "20% of the amount", "20% of 9 dollars", "we request 20% of donations"), compute it: apply the percentage to the base amount mentioned (e.g. "9 dollars" and "20%" → 9 * 0.20 = 1.80). If they say "the amount" or "donations" and a dollar figure appears in the text, use that as the base; if the only available base is the vault, use VAULT FUNDS AVAILABLE.
+   - Output the final number as claim_amount_usd (e.g. 1.8). Only set to null if there is no mention of any requested amount or percentage.
+2) Summarize what the NGO claims they did (impact + actions) in 3-6 bullet points (claim_summary). Use the CLAIM TEXT; do not leave empty.
+3) Summarize what evidence is present/credible (links, receipts, proof) in 3-6 bullet points (evidence_summary). Use the CLAIM TEXT and links; do not leave empty.
 
 OUTPUT STRICT JSON ONLY:
 {{
@@ -346,12 +349,7 @@ OUTPUT STRICT JSON ONLY:
             temperature=0.2,
         )
         raw = (resp.choices[0].message.content or "").strip()
-        # best-effort parse
-        try:
-            import json
-            data = json.loads(raw)
-        except Exception:
-            data = {}
+        data = _extract_json_obj(raw)
 
         claim_amount = data.get("claim_amount_usd", None)
         claim_amount_f = None if claim_amount is None else _safe_float(claim_amount, default=0.0)
@@ -451,26 +449,31 @@ OUTPUT STRICT JSON ONLY:
         claim_amount = state.get("claim_amount_usd", None)
         claim_summary = state.get("claim_summary", "")
         evidence_summary = state.get("evidence_summary", "")
+        links_summary = state.get("links_summary", "")
 
-        prompt = f"""You recommend how much USD to release from a disaster relief vault to an NGO.
+        # All amounts are USD. Spell out the check so the model cannot "preserve" by outputting 0.
+        vault_covers_claim = claim_amount is not None and vault_usd >= float(claim_amount)
+        prompt = f"""You recommend how much to release from a disaster relief vault to an NGO. All amounts are in USD (dollars).
 
-VAULT_BALANCE_USD: {vault_usd}
-CLAIM_AMOUNT_USD: {claim_amount if claim_amount is not None else "null"}
+VAULT_BALANCE_USD: {vault_usd} USD
+CLAIM_AMOUNT_USD: {claim_amount if claim_amount is not None else "null (unspecified)"} USD
+
+{"The vault has enough to cover the full claim (" + str(claim_amount) + " <= " + str(round(vault_usd, 2)) + "). You MUST recommend a positive amount in USD (e.g. " + str(claim_amount) + " or the full claim). Outputting 0 is wrong." if vault_covers_claim else "The vault has " + str(round(vault_usd, 2)) + " USD. You MUST recommend a positive amount in USD (never 0)."}
 
 CLAIM_SUMMARY:
-{claim_summary}
+{claim_summary or "(none)"}
 
 EVIDENCE_SUMMARY:
-{evidence_summary}
+{evidence_summary or "(none)"}
 
-RULES:
-- Recommend a single number in USD.
-- The recommendation MUST be <= VAULT_BALANCE_USD.
-- If evidence is weak or unclear, recommend a conservative amount. 
-- NEVER EVER output 0 as the recommended amount. Look through the claim request and give EXACTLY what they ask for!
-- If claim amount is provided, the recommendation MUST be <= CLAIM_AMOUNT_USD.
-- Output STRICT JSON ONLY with a single numeric field and NO currency symbols, NO commas:
-{{ "recommended_amount_usd": 1234.56 }}
+LINKS_SUMMARY:
+{links_summary or "(none)"}
+
+RULES (all amounts in USD):
+- Output ONLY valid JSON: {{ "recommended_amount_usd": 1234.56 }}. No other text. No currency symbols or commas in the number.
+- recommended_amount_usd MUST be a positive number whenever the vault balance is positive. Never output 0.
+- recommended_amount_usd <= VAULT_BALANCE_USD. If CLAIM_AMOUNT_USD is given, recommended_amount_usd <= CLAIM_AMOUNT_USD.
+- Do NOT recommend 0 to "preserve" or "reserve" funds. Your task is to set the release amount in USD; it must be positive when the vault has funds.
 """
 
         # Add input/output tracking
@@ -502,12 +505,21 @@ RULES:
                     pass
         raw = (resp.choices[0].message.content or "").strip()
 
-        try:
-            import json
-            data = json.loads(raw)
-            rec = _safe_float(data.get("recommended_amount_usd", 0.0), default=0.0)
-        except Exception:
-            rec = 0.0
+        data = _extract_json_obj(raw)
+        rec = _safe_float(data.get("recommended_amount_usd", 0.0), default=0.0)
+
+        # If model returned 0 despite vault having funds, retry once with a minimal prompt (agent still decides the amount)
+        if rec <= 0 and vault_usd > 0:
+            retry_prompt = f"""All amounts are in USD. Vault balance: {vault_usd} USD. Claim amount: {claim_amount if claim_amount is not None else "unspecified"} USD.
+Output ONLY this JSON with a positive number: {{ "recommended_amount_usd": N }} where N is the amount in USD to release (positive, never 0)."""
+            retry_resp = self.client.chat.completions.create(
+                model=self.reasoning_model,
+                messages=[{"role": "user", "content": retry_prompt}],
+                temperature=0.0,
+            )
+            retry_raw = (retry_resp.choices[0].message.content or "").strip()
+            retry_data = _extract_json_obj(retry_raw)
+            rec = _safe_float(retry_data.get("recommended_amount_usd", 0.0), default=0.0)
 
         # enforce hard constraints
         rec_before_clamp = float(rec)
@@ -619,12 +631,12 @@ RULES:
         images_summary = state.get("images_summary", "")
 
         prompt = f"""Write a short justification for why the recommended payout amount was chosen.
-This is NOT a chain-of-thought. Summarize the decision using only the provided facts.
+This is NOT a chain-of-thought. Summarize the decision using only the provided facts. All amounts are in USD (dollars)—always refer to them as "X USD" or "X dollars", never as "units".
 
-FACTS:
-- vault_balance_usd: {vault_usd}
-- claim_amount_usd: {claim_amount if claim_amount is not None else "null"}
-- recommended_amount_usd: {recommended}
+FACTS (all in USD):
+- vault_balance_usd: {vault_usd} USD
+- claim_amount_usd: {claim_amount if claim_amount is not None else "null"} USD
+- recommended_amount_usd: {recommended} USD
 
 claim_summary:
 {claim_summary}
@@ -636,9 +648,8 @@ images_summary:
 {images_summary}
 
 OUTPUT:
-- 4-10 bullet points
-- No question marks
-- No currency symbols
+- 4-10 bullet points. Always say amounts in USD (e.g. "8 USD", "1.8 dollars"). Never use "units".
+- No question marks.
 """
 
         resp = self.client.chat.completions.create(
