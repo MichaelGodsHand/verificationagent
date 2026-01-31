@@ -466,7 +466,8 @@ EVIDENCE_SUMMARY:
 RULES:
 - Recommend a single number in USD.
 - The recommendation MUST be <= VAULT_BALANCE_USD.
-- If evidence is weak or unclear, recommend a conservative amount.
+- If evidence is weak or unclear, recommend a conservative amount. 
+- NEVER EVER output 0 as the recommended amount. Look through the claim request and give EXACTLY what they ask for!
 - If claim amount is provided, the recommendation MUST be <= CLAIM_AMOUNT_USD.
 - Output STRICT JSON ONLY with a single numeric field and NO currency symbols, NO commas:
 {{ "recommended_amount_usd": 1234.56 }}
