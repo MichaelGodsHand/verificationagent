@@ -837,6 +837,10 @@ OUTPUT:
 app = FastAPI(title="NGO Claim Verification Agent", version="1.0.0")
 agent = NGOClaimVerifierAgent()
 
+@app.head("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "ok"}
 
 @app.post("/verify")
 async def verify(
