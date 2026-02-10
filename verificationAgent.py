@@ -46,7 +46,7 @@ load_dotenv()
 
 
 RPC_URL = os.getenv("RPC_URL", "https://ethereum-sepolia-rpc.publicnode.com")
-COINGECKO_ETH_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+ETH_PRICE_API_URL = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
 
 # Single source of truth: updated by background thread once per minute. No per-request API calls.
 _ETH_PRICE_LAST: Optional[float] = None
@@ -55,11 +55,12 @@ _ETH_PRICE_REFRESH_INTERVAL_SEC = 60
 
 
 def _fetch_eth_price_from_api() -> Optional[float]:
-    """Call CoinGecko once. Returns price or None on failure (caller keeps previous value)."""
+    """Call Binance once for ETH/USDT. Returns price or None on failure (caller keeps previous value)."""
     try:
-        r = requests.get(COINGECKO_ETH_PRICE_URL, timeout=15)
+        r = requests.get(ETH_PRICE_API_URL, timeout=15)
         r.raise_for_status()
-        return float(r.json()["ethereum"]["usd"])
+        data = r.json()
+        return float(data["price"])
     except Exception as e:
         print(f"[ETH PRICE] Fetch failed: {e}")
         return None
@@ -78,7 +79,7 @@ def _eth_price_background_loop() -> None:
 
 def _get_eth_price_usd() -> float:
     """
-    Return the last ETH/USD price from the background updater (one CoinGecko call per minute).
+    Return the last ETH/USDT price from the background updater (one Binance call per minute).
     If no value yet (e.g. startup failed), try one fetch so the first request can still succeed.
     """
     with _ETH_PRICE_LOCK:
@@ -94,7 +95,7 @@ def _get_eth_price_usd() -> float:
         if _ETH_PRICE_LAST is not None:
             return float(_ETH_PRICE_LAST)
     raise RuntimeError(
-        "ETH price not available (CoinGecko fetch failed; background thread will retry in 60s)"
+        "ETH price not available (price API fetch failed; background thread will retry in 60s)"
     )
 
 
@@ -282,7 +283,7 @@ class NGOClaimVerifierAgent:
         balance_wei = w3.eth.get_balance(checksum)
         balance_eth = balance_wei / 1e18
 
-        # Use price already fetched at request start (passed in state); no CoinGecko call here.
+        # Use price already fetched at request start (passed in state).
         eth_price_usd = float(state.get("eth_price_usd") or 0.0)
         if eth_price_usd <= 0:
             raise ValueError("eth_price_usd must be set in state (fetched once at request start)")
@@ -928,7 +929,7 @@ async def verify(
     vault_address: str = Form(...),
     images: List[UploadFile] = File(default=[]),
 ):
-    # Use price from background task (one CoinGecko request per minute app-wide).
+    # Use price from background task (one Binance request per minute app-wide).
     eth_price_usd = _get_eth_price_usd()
 
     image_inputs: List[_ImageInput] = []
@@ -942,7 +943,7 @@ async def verify(
             }
         )
 
-    # Pass pre-fetched price through so graph nodes do not call CoinGecko.
+    # Pass pre-fetched price through so graph nodes use the same value.
     result_state = agent.run(
         content=content,
         vault_address=vault_address,
@@ -1395,3 +1396,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("VERIFY_API_PORT", "8080")))
+
