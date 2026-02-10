@@ -46,7 +46,8 @@ load_dotenv()
 
 
 RPC_URL = os.getenv("RPC_URL", "https://ethereum-sepolia-rpc.publicnode.com")
-ETH_PRICE_API_URL = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+ETH_PRICE_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol=ETH&convert=USD"
+CMC_PRO_API_KEY = (os.getenv("X-CMC_PRO_API_KEY") or os.getenv("CMC_PRO_API_KEY") or "").strip()
 
 # Single source of truth: updated by background thread once per minute. No per-request API calls.
 _ETH_PRICE_LAST: Optional[float] = None
@@ -55,12 +56,16 @@ _ETH_PRICE_REFRESH_INTERVAL_SEC = 60
 
 
 def _fetch_eth_price_from_api() -> Optional[float]:
-    """Call Binance once for ETH/USDT. Returns price or None on failure (caller keeps previous value)."""
+    """Call CoinMarketCap once for ETH/USD. Returns price or None on failure (caller keeps previous value)."""
+    if not CMC_PRO_API_KEY:
+        print("[ETH PRICE] X-CMC_PRO_API_KEY not set in .env; skipping fetch")
+        return None
     try:
-        r = requests.get(ETH_PRICE_API_URL, timeout=15)
+        headers = {"X-CMC_PRO_API_KEY": CMC_PRO_API_KEY}
+        r = requests.get(ETH_PRICE_API_URL, headers=headers, timeout=15)
         r.raise_for_status()
         data = r.json()
-        return float(data["price"])
+        return float(data["data"]["ETH"]["quote"]["USD"]["price"])
     except Exception as e:
         print(f"[ETH PRICE] Fetch failed: {e}")
         return None
@@ -79,7 +84,7 @@ def _eth_price_background_loop() -> None:
 
 def _get_eth_price_usd() -> float:
     """
-    Return the last ETH/USDT price from the background updater (one Binance call per minute).
+    Return the last ETH/USD price from the background updater (one CoinMarketCap call per minute).
     If no value yet (e.g. startup failed), try one fetch so the first request can still succeed.
     """
     with _ETH_PRICE_LOCK:
@@ -929,7 +934,7 @@ async def verify(
     vault_address: str = Form(...),
     images: List[UploadFile] = File(default=[]),
 ):
-    # Use price from background task (one Binance request per minute app-wide).
+    # Use price from background task (one CoinMarketCap request per minute app-wide).
     eth_price_usd = _get_eth_price_usd()
 
     image_inputs: List[_ImageInput] = []
@@ -1396,4 +1401,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("VERIFY_API_PORT", "8080")))
-
