@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, TypedDict
 
@@ -44,6 +45,54 @@ load_dotenv()
 
 RPC_URL = os.getenv("RPC_URL", "https://ethereum-sepolia-rpc.publicnode.com")
 COINGECKO_ETH_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+
+# In-memory cache for ETH price to avoid CoinGecko rate limits (429) in production.
+_ETH_PRICE_CACHE: Dict[str, Any] = {"price": None, "ts": 0.0}
+_ETH_PRICE_CACHE_TTL_SEC = 120  # 2 minutes
+
+
+def _get_eth_price_usd() -> float:
+    """
+    Fetch ETH/USD from CoinGecko with retry on 429 and short-lived cache.
+    Reduces 429 errors when deployed (e.g. Render.com) where rate limits are hit.
+    """
+    now = time.monotonic()
+    if _ETH_PRICE_CACHE["price"] is not None and (now - _ETH_PRICE_CACHE["ts"]) < _ETH_PRICE_CACHE_TTL_SEC:
+        return float(_ETH_PRICE_CACHE["price"])
+    last_exc: Optional[Exception] = None
+    for attempt in range(4):  # 0,1,2,3 -> up to 4 attempts
+        try:
+            r = requests.get(COINGECKO_ETH_PRICE_URL, timeout=15)
+            if r.status_code == 429:
+                last_exc = requests.exceptions.HTTPError(
+                    "429 Client Error: Too Many Requests for url: ...", response=r
+                )
+                if attempt < 3:
+                    wait_sec = (2 ** attempt) + 1  # 2, 3, 5 seconds
+                    time.sleep(wait_sec)
+                    continue
+                raise last_exc
+            r.raise_for_status()
+            price = float(r.json()["ethereum"]["usd"])
+            _ETH_PRICE_CACHE["price"] = price
+            _ETH_PRICE_CACHE["ts"] = now
+            return price
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            if e.response is not None and e.response.status_code == 429 and attempt < 3:
+                wait_sec = (2 ** attempt) + 1
+                time.sleep(wait_sec)
+                continue
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < 3:
+                time.sleep((2 ** attempt) + 1)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Failed to fetch ETH price after retries")
 
 
 def _extract_urls(text: str) -> List[str]:
@@ -230,9 +279,7 @@ class NGOClaimVerifierAgent:
         balance_wei = w3.eth.get_balance(checksum)
         balance_eth = balance_wei / 1e18
 
-        r = requests.get(COINGECKO_ETH_PRICE_URL, timeout=15)
-        r.raise_for_status()
-        eth_price_usd = float(r.json()["ethereum"]["usd"])
+        eth_price_usd = _get_eth_price_usd()
 
         vault_usd = balance_eth * eth_price_usd
         out: Dict[str, Any] = {
@@ -969,10 +1016,8 @@ async def vote(payload: Dict[str, Any] = Body(...)):
                         pass
                 return error_response
 
-            # Fetch ETH price
-            r = requests.get(COINGECKO_ETH_PRICE_URL, timeout=15)
-            r.raise_for_status()
-            eth_price_usd = float(r.json()["ethereum"]["usd"])
+            # Fetch ETH price (cached + retry on 429)
+            eth_price_usd = _get_eth_price_usd()
 
             # Vault balance
             vault_balance_wei = w3.eth.get_balance(vault)
@@ -1308,4 +1353,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("VERIFY_API_PORT", "8080")))
-
