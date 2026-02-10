@@ -87,6 +87,7 @@ def _get_eth_price_usd() -> float:
     Return the last ETH/USD price from the background updater (one CoinMarketCap call per minute).
     If no value yet (e.g. startup failed), try one fetch so the first request can still succeed.
     """
+    global _ETH_PRICE_LAST
     with _ETH_PRICE_LOCK:
         if _ETH_PRICE_LAST is not None:
             return float(_ETH_PRICE_LAST)
@@ -1401,3 +1402,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("VERIFY_API_PORT", "8080")))
+
