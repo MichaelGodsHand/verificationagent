@@ -21,7 +21,9 @@ from __future__ import annotations
 import base64
 import os
 import re
+import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, TypedDict
 
@@ -46,53 +48,54 @@ load_dotenv()
 RPC_URL = os.getenv("RPC_URL", "https://ethereum-sepolia-rpc.publicnode.com")
 COINGECKO_ETH_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
 
-# In-memory cache for ETH price to avoid CoinGecko rate limits (429) in production.
-_ETH_PRICE_CACHE: Dict[str, Any] = {"price": None, "ts": 0.0}
-_ETH_PRICE_CACHE_TTL_SEC = 120  # 2 minutes
+# Single source of truth: updated by background thread once per minute. No per-request API calls.
+_ETH_PRICE_LAST: Optional[float] = None
+_ETH_PRICE_LOCK = threading.Lock()
+_ETH_PRICE_REFRESH_INTERVAL_SEC = 60
+
+
+def _fetch_eth_price_from_api() -> Optional[float]:
+    """Call CoinGecko once. Returns price or None on failure (caller keeps previous value)."""
+    try:
+        r = requests.get(COINGECKO_ETH_PRICE_URL, timeout=15)
+        r.raise_for_status()
+        return float(r.json()["ethereum"]["usd"])
+    except Exception as e:
+        print(f"[ETH PRICE] Fetch failed: {e}")
+        return None
+
+
+def _eth_price_background_loop() -> None:
+    """Run forever: fetch price every N seconds and update global."""
+    global _ETH_PRICE_LAST
+    while True:
+        price = _fetch_eth_price_from_api()
+        if price is not None:
+            with _ETH_PRICE_LOCK:
+                _ETH_PRICE_LAST = price
+        time.sleep(_ETH_PRICE_REFRESH_INTERVAL_SEC)
 
 
 def _get_eth_price_usd() -> float:
     """
-    Fetch ETH/USD from CoinGecko with retry on 429 and short-lived cache.
-    Reduces 429 errors when deployed (e.g. Render.com) where rate limits are hit.
+    Return the last ETH/USD price from the background updater (one CoinGecko call per minute).
+    If no value yet (e.g. startup failed), try one fetch so the first request can still succeed.
     """
-    now = time.monotonic()
-    if _ETH_PRICE_CACHE["price"] is not None and (now - _ETH_PRICE_CACHE["ts"]) < _ETH_PRICE_CACHE_TTL_SEC:
-        return float(_ETH_PRICE_CACHE["price"])
-    last_exc: Optional[Exception] = None
-    for attempt in range(4):  # 0,1,2,3 -> up to 4 attempts
-        try:
-            r = requests.get(COINGECKO_ETH_PRICE_URL, timeout=15)
-            if r.status_code == 429:
-                last_exc = requests.exceptions.HTTPError(
-                    "429 Client Error: Too Many Requests for url: ...", response=r
-                )
-                if attempt < 3:
-                    wait_sec = (2 ** attempt) + 1  # 2, 3, 5 seconds
-                    time.sleep(wait_sec)
-                    continue
-                raise last_exc
-            r.raise_for_status()
-            price = float(r.json()["ethereum"]["usd"])
-            _ETH_PRICE_CACHE["price"] = price
-            _ETH_PRICE_CACHE["ts"] = now
-            return price
-        except requests.exceptions.HTTPError as e:
-            last_exc = e
-            if e.response is not None and e.response.status_code == 429 and attempt < 3:
-                wait_sec = (2 ** attempt) + 1
-                time.sleep(wait_sec)
-                continue
-            raise
-        except Exception as e:
-            last_exc = e
-            if attempt < 3:
-                time.sleep((2 ** attempt) + 1)
-                continue
-            raise
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("Failed to fetch ETH price after retries")
+    with _ETH_PRICE_LOCK:
+        if _ETH_PRICE_LAST is not None:
+            return float(_ETH_PRICE_LAST)
+    # Fallback: first request or startup failed — try once so we don't fail the request
+    price = _fetch_eth_price_from_api()
+    if price is not None:
+        with _ETH_PRICE_LOCK:
+            _ETH_PRICE_LAST = price
+        return price
+    with _ETH_PRICE_LOCK:
+        if _ETH_PRICE_LAST is not None:
+            return float(_ETH_PRICE_LAST)
+    raise RuntimeError(
+        "ETH price not available (CoinGecko fetch failed; background thread will retry in 60s)"
+    )
 
 
 def _extract_urls(text: str) -> List[str]:
@@ -892,7 +895,26 @@ OUTPUT:
             return result
 
 
-app = FastAPI(title="NGO Claim Verification Agent", version="1.0.0")
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    """Startup: fetch ETH price once, then start background thread that refreshes every 60s."""
+    global _ETH_PRICE_LAST
+    # Bootstrap so first request has a value
+    price = _fetch_eth_price_from_api()
+    if price is not None:
+        with _ETH_PRICE_LOCK:
+            _ETH_PRICE_LAST = price
+        print(f"[ETH PRICE] Startup fetch OK: ${_ETH_PRICE_LAST:.2f} USD")
+    else:
+        print("[ETH PRICE] Startup fetch failed; background thread will retry every 60s")
+    # Refresh every 60s in a daemon thread (one API call per minute total)
+    t = threading.Thread(target=_eth_price_background_loop, daemon=True)
+    t.start()
+    yield
+    # Shutdown: thread is daemon so it will exit when process exits
+
+
+app = FastAPI(title="NGO Claim Verification Agent", version="1.0.0", lifespan=_app_lifespan)
 agent = NGOClaimVerifierAgent()
 
 @app.head("/health")
@@ -906,7 +928,7 @@ async def verify(
     vault_address: str = Form(...),
     images: List[UploadFile] = File(default=[]),
 ):
-    # First action: fetch ETH price once so we never call CoinGecko again during this request.
+    # Use price from background task (one CoinGecko request per minute app-wide).
     eth_price_usd = _get_eth_price_usd()
 
     image_inputs: List[_ImageInput] = []
