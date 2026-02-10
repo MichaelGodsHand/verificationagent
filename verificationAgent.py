@@ -279,7 +279,10 @@ class NGOClaimVerifierAgent:
         balance_wei = w3.eth.get_balance(checksum)
         balance_eth = balance_wei / 1e18
 
-        eth_price_usd = _get_eth_price_usd()
+        # Use price already fetched at request start (passed in state); no CoinGecko call here.
+        eth_price_usd = float(state.get("eth_price_usd") or 0.0)
+        if eth_price_usd <= 0:
+            raise ValueError("eth_price_usd must be set in state (fetched once at request start)")
 
         vault_usd = balance_eth * eth_price_usd
         out: Dict[str, Any] = {
@@ -731,13 +734,21 @@ OUTPUT:
         g.add_edge("explain", END)
         return g.compile()
 
-    def run(self, *, content: str, vault_address: str, images: List[_ImageInput], verbose: bool = True) -> VerifyState:
+    def run(
+        self,
+        *,
+        content: str,
+        vault_address: str,
+        images: List[_ImageInput],
+        eth_price_usd: float,
+        verbose: bool = True,
+    ) -> VerifyState:
         # Set project name before trace creation
         from opik_integration import OPIK_AVAILABLE, OPIK_PROJECT
         if OPIK_AVAILABLE:
             import os
             os.environ["OPIK_PROJECT_NAME"] = OPIK_PROJECT
-        
+
         state: VerifyState = {
             "content": content,
             "vault_address": vault_address,
@@ -748,7 +759,7 @@ OUTPUT:
             "url_texts": [],
             "links_summary": "",
             "vault_balance_eth": 0.0,
-            "eth_price_usd": 0.0,
+            "eth_price_usd": float(eth_price_usd),
             "vault_balance_usd": 0.0,
             "claim_amount_usd": None,
             "claim_summary": "",
@@ -895,6 +906,9 @@ async def verify(
     vault_address: str = Form(...),
     images: List[UploadFile] = File(default=[]),
 ):
+    # First action: fetch ETH price once so we never call CoinGecko again during this request.
+    eth_price_usd = _get_eth_price_usd()
+
     image_inputs: List[_ImageInput] = []
     for f in images[:6]:
         b = await f.read()
@@ -906,8 +920,14 @@ async def verify(
             }
         )
 
-    # Always run in verbose mode and always return debug trace
-    result_state = agent.run(content=content, vault_address=vault_address, images=image_inputs, verbose=True)
+    # Pass pre-fetched price through so graph nodes do not call CoinGecko.
+    result_state = agent.run(
+        content=content,
+        vault_address=vault_address,
+        images=image_inputs,
+        eth_price_usd=eth_price_usd,
+        verbose=True,
+    )
 
     response: Dict[str, Any] = {
         "recommended_amount_usd": float(result_state["recommended_amount_usd"]),
